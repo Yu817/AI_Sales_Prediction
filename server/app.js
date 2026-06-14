@@ -15,6 +15,8 @@ const supabaseKey =
   process.env.SUPABASE_ANON_KEY ||
   "sb_publishable_kNtrRiDqjye40HMYCI95Kw_oidkdgI8";
 const supabase = createClient(supabaseUrl, supabaseKey);
+const forecastModelVersion =
+  process.env.FORECAST_MODEL_VERSION || "retail-lstm-strict-v1";
 
 app.use(cors());
 app.use(express.json());
@@ -329,11 +331,11 @@ function normalizeModelHealth(latestRun) {
 }
 
 async function getProducts() {
-  return selectRows("products", "*", (query) => query.limit(100));
+  return selectRows("products", "*", (query) => query.limit(1000));
 }
 
 async function getInventory() {
-  return selectRows("inventory", "*", (query) => query.limit(200));
+  return selectRows("inventory", "*", (query) => query.limit(1000));
 }
 
 async function getSales(days = 45, productId = "all") {
@@ -351,6 +353,7 @@ async function getForecasts(days = 30, productId = "all") {
     let next = query
       .gte("forecast_date", fmt(today))
       .lte("forecast_date", toDate)
+      .eq("model_version", forecastModelVersion)
       .limit(1000);
     if (productId !== "all") next = next.eq("product_id", productId);
     return next;

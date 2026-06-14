@@ -84,6 +84,18 @@ function formatNumber(value) {
   return new Intl.NumberFormat("zh-TW").format(Math.round(Number(value || 0)));
 }
 
+function round(value, digits = 2) {
+  const factor = 10 ** digits;
+  return Math.round(Number(value || 0) * factor) / factor;
+}
+
+function formatDecimal(value, digits = 2) {
+  return new Intl.NumberFormat("zh-TW", {
+    maximumFractionDigits: digits,
+    minimumFractionDigits: digits,
+  }).format(Number(value || 0));
+}
+
 async function api(path, options = {}) {
   const response = await fetch(`${API_BASE_URL}${path}`, {
     headers: { "Content-Type": "application/json" },
@@ -93,6 +105,16 @@ async function api(path, options = {}) {
   if (!response.ok)
     throw new Error(payload.error || `API request failed: ${response.status}`);
   return payload;
+}
+
+function useLocalLstmData() {
+  return useAsyncData(async () => {
+    const response = await fetch("/data/local-lstm-dashboard.json");
+    if (!response.ok) {
+      throw new Error(`本機 LSTM 資料讀取失敗：${response.status}`);
+    }
+    return response.json();
+  }, []);
 }
 
 function useAsyncData(loader, deps = []) {
@@ -120,6 +142,180 @@ function useAsyncData(loader, deps = []) {
   }, deps);
 
   return state;
+}
+
+function buildLocalForecastSeries(rows = []) {
+  const map = new Map();
+  rows.forEach((row) => {
+    const current = map.get(row.forecast_date) || {
+      date: row.forecast_date,
+      predictedSales: 0,
+      riskCount: 0,
+    };
+    current.predictedSales += Number(row.predicted_units_sold || 0);
+    current.riskCount += row.stockout_risk ? 1 : 0;
+    map.set(row.forecast_date, current);
+  });
+  return [...map.values()].sort((a, b) => a.date.localeCompare(b.date));
+}
+
+function toLocalForecastChartRows(local, days = 14) {
+  if (!local) return [];
+  const rmse = Number(local.metrics.overall_rmse_units || 0);
+  return buildLocalForecastSeries(local.latestForecast)
+    .slice(0, days)
+    .map((row) => ({
+      date: row.date,
+      actualSales: null,
+      predictedSales: round(row.predictedSales),
+      lowerBound: round(Math.max(0, row.predictedSales - rmse)),
+      upperBound: round(row.predictedSales + rmse),
+      riskCount: row.riskCount,
+    }));
+}
+
+function localStatusFromRecommendation(row) {
+  return row.stockout_risk_next_7_days ? "shortage" : "healthy";
+}
+
+function localRecommendations(local) {
+  if (!local) return [];
+  return [...local.replenishment]
+    .sort((a, b) => b.recommended_order_qty - a.recommended_order_qty)
+    .map((item) => ({
+      productId: `${item["Store ID"]}-${item["Product ID"]}`,
+      productName: item["Product ID"],
+      category: item["Store ID"],
+      available: Number(item.latest_inventory_level || 0),
+      sevenDayDemand: Number(item.predicted_7_day_demand || 0),
+      safetyStock: Number(item.safety_stock_2_days || 0),
+      recommendedOrderQty: Number(item.recommended_order_qty || 0),
+      status: localStatusFromRecommendation(item),
+      confidence: 0.35,
+      firstStockoutDate: item.first_stockout_date,
+    }));
+}
+
+function buildLocalDashboardData(local) {
+  if (!local) return null;
+  const recommendations = localRecommendations(local);
+  const trendSnapshot = toLocalForecastChartRows(local, 7);
+  const todayForecast = trendSnapshot[0]?.predictedSales || 0;
+  const alerts = [
+    {
+      level: "warning",
+      title: "資料訊號不足",
+      message: `LSTM MAE ${formatDecimal(local.metrics.overall_mae_units)} 高於 Demand Forecast baseline ${formatDecimal(local.metrics.baseline_demand_forecast_mae_units)}，代表目前 CSV 資料主要訊號集中於 Demand Forecast。`,
+    },
+    {
+      level: "info",
+      title: "欄位政策已調整",
+      message: `已排除 ${local.metrics.feature_policy.excluded_from_lstm_inputs.join("、")}，較符合專題預測模型設定。`,
+    },
+  ];
+
+  return {
+    metrics: {
+      todayForecast,
+      monthlyAchievementRate: 0,
+      activeAlerts: recommendations.filter((item) => item.status !== "healthy").length,
+      lstmMae: local.metrics.overall_mae_units,
+      baselineMae: local.metrics.baseline_demand_forecast_mae_units,
+    },
+    trendSnapshot,
+    stockWarnings: recommendations.filter((item) => item.status !== "healthy").slice(0, 12),
+    alerts,
+    forecastError: null,
+    source: "local-lstm",
+  };
+}
+
+function buildLocalForecastCenterData(local) {
+  if (!local) return null;
+  const excluded = local.metrics.feature_policy.excluded_from_lstm_inputs;
+  return {
+    series: toLocalForecastChartRows(local, 7),
+    featureWeights: [
+      {
+        name: "Demand Forecast baseline",
+        contribution: Math.round(local.metrics.baseline_demand_forecast_mae_units),
+        direction: "baseline",
+      },
+      {
+        name: "LSTM MAE",
+        contribution: Math.round(local.metrics.overall_mae_units),
+        direction: "model_error",
+      },
+      {
+        name: "可用特徵數",
+        contribution: local.metrics.input_shape[1],
+        direction: "feature_count",
+      },
+      {
+        name: "排除欄位數",
+        contribution: excluded.length,
+        direction: "excluded",
+      },
+    ],
+    nonlinearEvents: [
+      {
+        date: local.generatedAt.slice(0, 10),
+        productName: "資料欄位調整",
+        type: "Demand Forecast 移為 baseline",
+        impact: `LSTM MAE ${formatDecimal(local.metrics.overall_mae_units)}`,
+        response: "需補強 POS 交易、天氣、節慶、顧客行為等真實特徵",
+      },
+      {
+        date: local.generatedAt.slice(0, 10),
+        productName: "模型輸入政策",
+        type: "排除不適用欄位",
+        impact: excluded.join("、"),
+        response: "避免既有預測欄位造成模型目的不清",
+      },
+    ],
+    modelNote:
+      "此頁已依原銷量預測分析中心介面顯示本機 LSTM 結果；特徵權重區目前顯示欄位政策與 baseline 比較。",
+  };
+}
+
+function buildLocalFeatureMonitorData(local) {
+  if (!local) return null;
+  const futureFeatures = local.metrics.feature_policy.future_known_features || [];
+  return {
+    externalFactors: {
+      weather: futureFeatures
+        .filter((name) => name.startsWith("Weather Condition_"))
+        .map((name) => ({
+          region: name.replace("Weather Condition_", ""),
+          temperature: "-",
+          rainfall_probability: 0,
+        })),
+      holidays: [
+        {
+          date: local.generatedAt.slice(0, 10),
+          name: "Holiday/Promotion 欄位已納入",
+          expectedImpact: "可作為未來促銷/節慶條件",
+        },
+      ],
+      promotions: [
+        {
+          name: "Discount / Price 情境欄位",
+          status: "可用",
+          start_date: local.rawSummary.dateStart,
+          end_date: local.rawSummary.dateEnd,
+        },
+      ],
+      errors: {},
+    },
+    modelHealth: {
+      status: local.metrics.device === "cuda" ? "green" : "yellow",
+      label: local.metrics.device === "cuda" ? "GPU 模型可用" : "CPU 模型可用",
+      lastRunAt: local.generatedAt,
+      optimizer: "Adam",
+      weightUpdated: true,
+      note: `${local.metrics.framework} ${local.metrics.torch_version}，輸入形狀 ${local.metrics.input_shape.join(" × ")}`,
+    },
+  };
 }
 
 function Card({ title, icon: Icon, children, action }) {
@@ -235,38 +431,66 @@ function ForecastChart({ data, height = 330 }) {
 
 function DashboardView() {
   const { loading, error, data } = useAsyncData(() => api("/dashboard"), []);
-  if (loading) return <LoadingPanel />;
-  if (error) return <ErrorPanel message={error} />;
-  if (!data?.metrics)
+  const localState = useLocalLstmData();
+  const localDashboard = useMemo(
+    () => buildLocalDashboardData(localState.data),
+    [localState.data],
+  );
+  const viewData = data?.metrics ? data : localDashboard;
+  if ((loading || localState.loading) && !viewData) return <LoadingPanel />;
+  if (error && !viewData) return <ErrorPanel message={error} />;
+  if (!viewData?.metrics)
     return (
       <ErrorPanel message="/api/dashboard 回傳格式不正確，請確認 Vercel API 路由是否正常" />
     );
 
   return (
     <div className="view-grid">
+      {error && viewData.source === "local-lstm" && (
+        <div className="empty-state error">
+          Supabase API 暫時無法讀取：{error}。目前先顯示本機 LSTM 分析結果。
+        </div>
+      )}
+
       <Card title="核心指標看板" icon={BarChart3}>
         <div className="metrics-grid">
           <MetricCard
-            title="今日預計銷量"
-            value={formatNumber(data.metrics.todayForecast)}
+            title={viewData.source === "local-lstm" ? "最近 7 天首日預測" : "今日預計銷量"}
+            value={formatNumber(viewData.metrics.todayForecast)}
             suffix=" 件"
             description="由 LSTM 預測模型彙整"
             icon={TrendingUp}
             tone="blue"
           />
           <MetricCard
-            title="本月銷量達成率"
-            value={data.metrics.monthlyAchievementRate}
-            suffix="%"
-            description="以本月累積銷量 / 預估月目標計算"
+            title={viewData.source === "local-lstm" ? "LSTM MAE" : "本月銷量達成率"}
+            value={
+              viewData.source === "local-lstm"
+                ? formatDecimal(viewData.metrics.lstmMae)
+                : viewData.metrics.monthlyAchievementRate
+            }
+            suffix={viewData.source === "local-lstm" ? " 件" : "%"}
+            description={
+              viewData.source === "local-lstm"
+                ? "不使用 Demand Forecast 作為輸入"
+                : "以本月累積銷量 / 預估月目標計算"
+            }
             icon={BarChart3}
             tone="green"
           />
           <MetricCard
-            title="系統偵測異動警示"
-            value={data.metrics.activeAlerts}
-            suffix=" 則"
-            description="庫存、模型與銷售波動警示"
+            title={viewData.source === "local-lstm" ? "Baseline MAE" : "系統偵測異動警示"}
+            value={
+              viewData.source === "local-lstm"
+                ? formatDecimal(viewData.metrics.baselineMae)
+                : viewData.metrics.activeAlerts
+            }
+            suffix={viewData.source === "local-lstm" ? " 件" : " 則"}
+            description={
+              viewData.source === "local-lstm"
+                ? "Demand Forecast 僅作比較基準"
+                : "庫存、模型與銷售波動警示"
+            }
             icon={AlertTriangle}
             tone="orange"
           />
@@ -274,17 +498,17 @@ function DashboardView() {
       </Card>
 
       <Card title="14 天銷量預測曲線（趨勢快照）" icon={LineChartIcon}>
-        {data.forecastError ? (
+        {viewData.forecastError ? (
           <div className="empty-state error">
-            預測數據載入失敗：{data.forecastError}，請稍後再試
+            預測數據載入失敗：{viewData.forecastError}，請稍後再試
           </div>
         ) : (
-          <ForecastChart data={data.trendSnapshot} height={300} />
+          <ForecastChart data={viewData.trendSnapshot} height={300} />
         )}
       </Card>
 
       <Card title="自動化進貨預警" icon={ShoppingCart}>
-        {data.forecastError ? (
+        {viewData.forecastError ? (
           <div className="empty-state error">
             預測數據載入失敗：無法計算進貨預警，請稍後再試
           </div>
@@ -302,7 +526,7 @@ function DashboardView() {
                   </tr>
                 </thead>
                 <tbody>
-                  {data.stockWarnings.map((item) => (
+                  {viewData.stockWarnings.map((item) => (
                     <tr key={item.productId}>
                       <td>
                         {item.productName}
@@ -323,7 +547,7 @@ function DashboardView() {
                 </tbody>
               </table>
             </div>
-            {!data.stockWarnings.length && (
+            {!viewData.stockWarnings.length && (
               <EmptyState message="目前指標正常，無須進貨" />
             )}
           </>
@@ -332,7 +556,7 @@ function DashboardView() {
 
       <Card title="異動警示中心" icon={AlertTriangle}>
         <div className="alert-list">
-          {data.alerts.map((alert, index) => (
+          {viewData.alerts.map((alert, index) => (
             <div
               className={`alert-item ${alert.level}`}
               key={`${alert.title}-${index}`}
@@ -349,6 +573,7 @@ function DashboardView() {
 
 function ForecastCenter() {
   const productsState = useAsyncData(() => api("/products"), []);
+  const localState = useLocalLstmData();
   const [productId, setProductId] = useState("all");
   const [days, setDays] = useState(14);
   const { loading, error, data } = useAsyncData(
@@ -357,6 +582,11 @@ function ForecastCenter() {
   );
 
   const products = productsState.data?.products || [];
+  const localForecast = useMemo(
+    () => buildLocalForecastCenterData(localState.data),
+    [localState.data],
+  );
+  const viewData = data?.series ? data : localForecast;
   const barColors = [
     "#2563eb",
     "#0ea5e9",
@@ -395,18 +625,23 @@ function ForecastCenter() {
           </div>
         }
       >
-        {loading && <LoadingPanel />}
-        {error && <ErrorPanel message={error} />}
-        {data && <ForecastChart data={data.series} height={360} />}
-        {data?.modelNote && <p className="hint">{data.modelNote}</p>}
+        {loading && !viewData && <LoadingPanel />}
+        {error && viewData && (
+          <div className="empty-state error">
+            Supabase API 暫時無法讀取：{error}。目前顯示本機 LSTM 預測結果。
+          </div>
+        )}
+        {error && !viewData && <ErrorPanel message={error} />}
+        {viewData && <ForecastChart data={viewData.series} height={360} />}
+        {viewData?.modelNote && <p className="hint">{viewData.modelNote}</p>}
       </Card>
 
       <div className="two-column">
         <Card title="多維度特徵權重視圖" icon={Sparkles}>
-          {data?.featureWeights?.length ? (
+          {viewData?.featureWeights?.length ? (
             <ResponsiveContainer width="100%" height={300}>
               <BarChart
-                data={data.featureWeights}
+                data={viewData.featureWeights}
                 layout="vertical"
                 margin={{ top: 12, right: 20, left: 20, bottom: 12 }}
               >
@@ -415,7 +650,7 @@ function ForecastCenter() {
                 <YAxis type="category" dataKey="name" width={92} />
                 <Tooltip />
                 <Bar dataKey="contribution" name="貢獻度">
-                  {data.featureWeights.map((entry, index) => (
+                  {viewData.featureWeights.map((entry, index) => (
                     <Cell
                       key={entry.name}
                       fill={barColors[index % barColors.length]}
@@ -431,10 +666,10 @@ function ForecastCenter() {
 
         <Card title="非線性變動追蹤" icon={AlertTriangle}>
           <div className="timeline">
-            {!data?.nonlinearEvents?.length && (
+            {!viewData?.nonlinearEvents?.length && (
               <EmptyState message="Supabase nonlinear_events 表目前沒有資料" />
             )}
-            {data?.nonlinearEvents?.map((event) => (
+            {viewData?.nonlinearEvents?.map((event) => (
               <div
                 className="timeline-item"
                 key={`${event.date}-${event.type}`}
@@ -460,6 +695,7 @@ function StockControl() {
     () => api("/stock-control"),
     [],
   );
+  const localState = useLocalLstmData();
   const productsState = useAsyncData(() => api("/products"), []);
   const [simForm, setSimForm] = useState({
     productId: "all",
@@ -468,17 +704,36 @@ function StockControl() {
   });
   const [simulation, setSimulation] = useState(null);
   const [orderResult, setOrderResult] = useState(null);
+  const localRecommendationsData = useMemo(
+    () => localRecommendations(localState.data),
+    [localState.data],
+  );
+  const localStability = useMemo(() => {
+    if (!localState.data) return null;
+    const ratio =
+      localState.data.metrics.baseline_demand_forecast_mae_units > 0
+        ? localState.data.metrics.overall_mae_units /
+          localState.data.metrics.baseline_demand_forecast_mae_units
+        : 0;
+    return {
+      confidenceBandAvg: formatDecimal(localState.data.metrics.overall_rmse_units),
+      volatilityScore: formatDecimal(ratio, 1),
+      bufferSuggestion:
+        "目前 CSV 在排除 Demand Forecast 後訊號不足，建議正式系統補強 POS 與顧客行為特徵",
+      riskLevel: "high",
+    };
+  }, [localState.data]);
 
   const orderItems = useMemo(
     () =>
-      data?.recommendations
+      (data?.recommendations || localRecommendationsData)
         ?.filter((item) => item.recommendedOrderQty > 0)
         .map((item) => ({
           productId: item.productId,
           productName: item.productName,
           quantity: item.recommendedOrderQty,
         })) || [],
-    [data],
+    [data, localRecommendationsData],
   );
 
   async function runSimulation() {
@@ -505,11 +760,19 @@ function StockControl() {
     }
   }
 
-  if (loading) return <LoadingPanel />;
-  if (error) return <ErrorPanel message={error} />;
+  const recommendations = data?.recommendations || localRecommendationsData;
+  const stability = data?.stability || localStability;
+  if (loading && !recommendations.length) return <LoadingPanel />;
+  if (error && !recommendations.length) return <ErrorPanel message={error} />;
 
   return (
     <div className="view-grid">
+      {error && recommendations.length > 0 && (
+        <div className="empty-state error">
+          Supabase API 暫時無法讀取：{error}。目前先顯示本機 LSTM 補貨建議。
+        </div>
+      )}
+
       <Card
         title="智慧訂單建議"
         icon={PackageCheck}
@@ -536,7 +799,7 @@ function StockControl() {
               </tr>
             </thead>
             <tbody>
-              {data.recommendations.map((item) => (
+              {recommendations.map((item) => (
                 <tr key={item.productId}>
                   <td>
                     {item.productName}
@@ -670,13 +933,18 @@ function StockControl() {
               <p className="hint">{simulation.summary.recommendation}</p>
             </>
           )}
+          {!data && (
+            <p className="hint">
+              目前顯示本機 LSTM 補貨建議；情境模擬需連接 POS/促銷資料庫後才可即時重算。
+            </p>
+          )}
         </Card>
 
         <Card title="穩定性報告" icon={CheckCircle2}>
-          <div className={`stability ${data.stability.riskLevel}`}>
-            <strong>{data.stability.bufferSuggestion}</strong>
-            <p>平均置信區間寬度：{data.stability.confidenceBandAvg}%</p>
-            <p>預測波動分數：{data.stability.volatilityScore}%</p>
+          <div className={`stability ${stability?.riskLevel || "medium"}`}>
+            <strong>{stability?.bufferSuggestion}</strong>
+            <p>平均置信區間寬度：{stability?.confidenceBandAvg}%</p>
+            <p>預測波動分數：{stability?.volatilityScore}%</p>
           </div>
         </Card>
       </div>
@@ -689,20 +957,31 @@ function FeatureMonitor() {
     () => api("/feature-monitor"),
     [],
   );
-  if (loading) return <LoadingPanel />;
-  if (error) return <ErrorPanel message={error} />;
+  const localState = useLocalLstmData();
+  const localMonitor = useMemo(
+    () => buildLocalFeatureMonitorData(localState.data),
+    [localState.data],
+  );
+  const viewData = data?.externalFactors ? data : localMonitor;
+  if ((loading || localState.loading) && !viewData) return <LoadingPanel />;
+  if (error && !viewData) return <ErrorPanel message={error} />;
 
   return (
     <div className="view-grid">
+      {error && viewData && (
+        <div className="empty-state error">
+          Supabase API 暫時無法讀取：{error}。目前顯示本機 LSTM 欄位監控結果。
+        </div>
+      )}
       <Card title="外部因子監控站" icon={CloudSun}>
         <h3 className="sub-heading">氣候指數</h3>
-        {data.externalFactors.errors?.weather ? (
+        {viewData.externalFactors.errors?.weather ? (
           <div className="empty-state error">
-            {data.externalFactors.errors.weather}
+            {viewData.externalFactors.errors.weather}
           </div>
-        ) : data.externalFactors.weather.length ? (
+        ) : viewData.externalFactors.weather.length ? (
           <div className="factor-grid">
-            {data.externalFactors.weather.map((item, index) => (
+            {viewData.externalFactors.weather.map((item, index) => (
               <div
                 className="factor-card"
                 key={`${item.region || item.city}-${index}`}
@@ -721,13 +1000,13 @@ function FeatureMonitor() {
         )}
 
         <h3 className="sub-heading">節慶行事曆</h3>
-        {data.externalFactors.errors?.holidays ? (
+        {viewData.externalFactors.errors?.holidays ? (
           <div className="empty-state error">
-            {data.externalFactors.errors.holidays}
+            {viewData.externalFactors.errors.holidays}
           </div>
-        ) : data.externalFactors.holidays.length ? (
+        ) : viewData.externalFactors.holidays.length ? (
           <div className="timeline compact">
-            {data.externalFactors.holidays.map((holiday) => (
+            {viewData.externalFactors.holidays.map((holiday) => (
               <div className="timeline-item" key={holiday.date}>
                 <span>{holiday.date}</span>
                 <strong>{holiday.name}</strong>
@@ -740,11 +1019,11 @@ function FeatureMonitor() {
         )}
 
         <h3 className="sub-heading">促銷活動排程</h3>
-        {data.externalFactors.errors?.promotions ? (
+        {viewData.externalFactors.errors?.promotions ? (
           <div className="empty-state error">
-            {data.externalFactors.errors.promotions}
+            {viewData.externalFactors.errors.promotions}
           </div>
-        ) : data.externalFactors.promotions.length ? (
+        ) : viewData.externalFactors.promotions.length ? (
           <div className="table-wrap">
             <table>
               <thead>
@@ -755,7 +1034,7 @@ function FeatureMonitor() {
                 </tr>
               </thead>
               <tbody>
-                {data.externalFactors.promotions.map((promo, index) => (
+                {viewData.externalFactors.promotions.map((promo, index) => (
                   <tr key={`${promo.name}-${index}`}>
                     <td>{promo.name}</td>
                     <td>
@@ -775,22 +1054,22 @@ function FeatureMonitor() {
       </Card>
 
       <Card title="模型運行健康度" icon={Gauge}>
-        <div className={`health-light ${data.modelHealth.status}`}>
+        <div className={`health-light ${viewData.modelHealth.status}`}>
           <span />
           <div>
-            <strong>{data.modelHealth.label}</strong>
+            <strong>{viewData.modelHealth.label}</strong>
             <p>
               最後執行：
-              {data.modelHealth.lastRunAt
-                ? new Date(data.modelHealth.lastRunAt).toLocaleString("zh-TW")
+              {viewData.modelHealth.lastRunAt
+                ? new Date(viewData.modelHealth.lastRunAt).toLocaleString("zh-TW")
                 : "Supabase 尚無紀錄"}
             </p>
             <p>
-              優化器：{data.modelHealth.optimizer || "Supabase 尚無紀錄"}
+              優化器：{viewData.modelHealth.optimizer || "Supabase 尚無紀錄"}
               ｜權重更新：
-              {data.modelHealth.weightUpdated ? "已完成" : "未完成"}
+              {viewData.modelHealth.weightUpdated ? "已完成" : "未完成"}
             </p>
-            <small>{data.modelHealth.note}</small>
+            <small>{viewData.modelHealth.note}</small>
           </div>
         </div>
       </Card>

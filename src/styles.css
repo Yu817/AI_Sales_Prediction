@@ -157,6 +157,23 @@ main {
     gap: 18px;
 }
 
+.local-metrics {
+    margin-bottom: 16px;
+}
+
+.local-note {
+    border: 1px solid #dbeafe;
+    background: #eff6ff;
+    color: #334155;
+    border-radius: 16px;
+    padding: 14px 16px;
+    line-height: 1.7;
+}
+
+.local-note strong {
+    color: #1d4ed8;
+}
+
 .metric-card,
 .card {
     background: rgba(255, 255, 255, 0.88);
@@ -264,6 +281,18 @@ main {
 .table-wrap {
     width: 100%;
     overflow-x: auto;
+}
+
+.compact-table {
+    margin-top: 18px;
+    max-height: 360px;
+    overflow: auto;
+    border: 1px solid #e2e8f0;
+    border-radius: 16px;
+}
+
+.compact-table table {
+    min-width: 700px;
 }
 
 table {

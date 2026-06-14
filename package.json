@@ -4,11 +4,14 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "prepare-data": "node scripts/prepare-local-lstm-data.js",
+    "sync-lstm:dry-run": "node scripts/sync-lstm-to-supabase.js --dry-run",
+    "sync-lstm:supabase": "node scripts/sync-lstm-to-supabase.js",
     "dev": "concurrently \"npm run server:dev\" \"npm run client:dev\"",
     "server:dev": "set RUN_EXPRESS_SERVER=true&& nodemon server/app.js",
     "server:start": "set RUN_EXPRESS_SERVER=true&& node server/app.js",
-    "client:dev": "vite --host 0.0.0.0",
-    "build": "vite build",
+    "client:dev": "npm run prepare-data && vite --host 0.0.0.0 --port 5173 --strictPort",
+    "build": "npm run prepare-data && vite build",
     "preview": "vite preview --host 0.0.0.0"
   },
   "dependencies": {
